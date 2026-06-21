@@ -1,0 +1,112 @@
+variable "environment" {
+  description = "Name of environment (dev, test, prod)"
+  type        = string
+}
+
+variable "region" {
+  description = "gcp region"
+  type        = string
+}
+
+variable "project_id" {
+  description = "gc project id"
+  type        = string
+}
+
+variable "project_number" {
+  description = "GCP project"
+  type        = string
+}
+
+variable "service_name" {
+  description = "The name of the CloudRun service"
+  type        = string
+}
+
+variable "docker_image" {
+  description = "Docker image to deploy"
+  type        = string
+}
+
+variable "docker_image_tag" {
+  description = "Docker image tag to deploy"
+  type        = string
+}
+
+variable "vpc_name" {
+  description = "VPC name"
+  type        = string
+}
+
+variable "domain_name_public" {
+  description = "Domain name for the service e.g: feeltheagi.dev.spiffy.ai"
+  type        = string
+}
+
+variable "dns_zone_name_public" {
+  description = "The DNS zone name (public) to use for the CloudRun service"
+  type        = object({
+    name     = string
+    provider = string
+  })
+}
+
+variable "dns_zone_name_private" {
+  description = "The DNS zone name (private) to use for the CloudRun service"
+  type        = string
+}
+
+variable "datadog_api_key" {
+  description = "Datadog API key"
+  type        = object({
+    secret  = string
+    version = string
+  })
+}
+
+variable "datadog_site" {
+  description = "Datadog site (e.g. datadoghq.com, datadoghq.eu, us3.datadoghq.com, etc.)"
+  type        = string
+}
+
+variable "datadog_trace_enabled" {
+  description = "Enable Datadog APM"
+  type        = bool
+}
+
+variable "team" {
+  description = "The team that owns the service"
+  type        = string
+  default     = "engineering"
+}
+
+variable "chapter" {
+  description = "The chapter that owns the service"
+  type        = string
+  default     = "backend"
+}
+
+variable "gke_cluster_name" {
+  description = "The name of the GKE cluster"
+  type        = string
+}
+
+variable "gke_cluster_namespace" {
+  description = "GKE Namespace to deploy the application"
+  type        = string
+}
+
+variable "managed_ssl_certificate_name" {
+  description = "The name of the managed SSL certificate to use for the ingress."
+  type        = string
+}
+
+variable "gpu_accelerator_type" {
+  description = "The type of GPU to use for the service"
+  type        = string
+}
+
+variable "gpu_accelerator_count" {
+  description = "The number of GPUs to use for the service"
+  type        = number
+}

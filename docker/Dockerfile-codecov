@@ -1,0 +1,7 @@
+FROM gcr.io/cloud-builders/curl
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y git
+WORKDIR /usr/bin
+RUN curl -Os https://cli.codecov.io/latest/linux/codecov
+RUN chmod +x codecov

@@ -1,0 +1,66 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  annotations:
+    provreq.kueue.x-k8s.io/maxRunDurationSeconds: "14400"
+  labels:
+    kueue.x-k8s.io/queue-name: dws-local-queue
+  name: test-debug-amey-vllm
+  namespace: apps-services-ns
+spec:
+  backoffLimit: 2
+  # Fail the job immediately if it exists with non-zero code
+  podFailurePolicy:
+    rules:
+    - action: FailJob
+      onExitCodes:
+        operator: NotIn
+        values: [0]
+  completionMode: NonIndexed
+  completions: 1
+  parallelism: 1
+  podReplacementPolicy: Failed
+  suspend: true
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+    spec:
+      containers:
+      - args:
+        - "14400"
+        command:
+        - sleep
+        env:
+        image: us-docker.pkg.dev/spiffy-prod/spiffy/vllm-openai:v0.6.6.post1_20250430
+        imagePullPolicy: IfNotPresent
+        name: test-debug-matt-vllm
+        volumeMounts:
+        - name: spiffy-train-data-volume
+          mountPath: /spiffy-train-dev
+        resources:
+          limits:
+            nvidia.com/gpu: 8
+            #nvidia.com/gpu: 2
+          requests:
+            nvidia.com/gpu: 8
+            #nvidia.com/gpu: 2
+      dnsPolicy: ClusterFirst
+      nodeSelector:
+        cloud.google.com/gke-accelerator: nvidia-h100-80gb
+      #nodeSelector:
+      #  cloud.google.com/gke-accelerator: nvidia-a100-80gb
+      restartPolicy: Never
+      schedulerName: default-scheduler
+      securityContext: {}
+      serviceAccount: model-train-job-k8-sa
+      serviceAccountName: model-train-job-k8-sa
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - effect: NoSchedule
+        key: nvidia.com/gpu
+        operator: Exists
+      volumes:
+      - name: spiffy-train-data-volume
+        persistentVolumeClaim:
+          claimName: model-train-job-gcs-pvc-v2

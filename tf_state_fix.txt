@@ -1,0 +1,31 @@
+sh ./tf.sh -e prod -a import module.llm-inference-service-set-us-west1[0].module.llm-inference-service-gcs-filestore-pv.kubernetes_persistent_volume.persistent_volume llm-inference-service-us-west1-nfs-rw-pv
+
+sh ./tf.sh -e prod -a import module.llm-inference-service-set-us-west1[0].module.llm-inference-service-gcs-bucket-pv.kubernetes_persistent_volume.persistent_volume llm-inference-service-us-west1-gcs-pv
+
+sh ./tf.sh -e prod -a import module.llm-inference-service-set-us-west1[0].module.llm-inference-service[0].module.llm-inference-service.kubernetes_service_account.kubernetes_service_account_k8_sa apps-llm-ns/llm-inference-service-llama-3-70b-k8-sa
+
+sh ./tf.sh -e prod -a import module.llm-inference-service-set-us-west1[0].module.llm-inference-service[0].module.llm-inference-service.kubernetes_manifest.kubernetes_manifest_ingress_backend_config "apiVersion=cloud.google.com/v1,kind=BackendConfig,namespace=apps-llm-ns,name=llm-inference-service-llama-3-70b-nodeport-backend-config"
+
+sh ./tf.sh -e prod -a import module.llm-inference-service-set-us-west1[0].module.llm-inference-service-gcs-filestore-transfer-agent.module.storage-transfer-agent-gke-service.kubernetes_manifest.kubernetes_manifest_ingress_backend_config "apiVersion=cloud.google.com/v1,kind=BackendConfig,namespace=apps-llm-ns,name=llm-inference-service-mta-nodeport-backend-config"
+
+sh ./tf.sh -e prod -a import module.llm-inference-service-set-us-west1[0].module.llm-inference-service[0].module.llm-inference-service.kubernetes_manifest.kubernetes_manifest_managed_cert_config[0] "apiVersion=networking.gke.io/v1,kind=ManagedCertificate,namespace=apps-llm-ns,name=prod-spiffy-env-domain-cert-for-llm-inference-service-llama-3-70b"
+
+sh ./tf.sh -e prod -a import module.llm-inference-service-set-us-west1[0].module.llm-inference-service-gcs-filestore-pv.kubernetes_persistent_volume_claim.persistent_volume_claim apps-llm-ns/llm-inference-service-us-west1-nfs-rw-pvc
+
+sh ./tf.sh -e prod -a import  module.llm-inference-service-set-us-west1[0].module.llm-inference-service-gcs-bucket-pv.kubernetes_persistent_volume_claim.persistent_volume_claim apps-llm-ns/llm-inference-service-us-west1-gcs-pvc
+
+sh ./tf.sh -e prod -a import module.llm-inference-service-set-us-west1[0].module.llm-inference-service[0].module.llm-inference-service.kubernetes_ingress_v1.service_ingress[0] apps-llm-ns/llm-inference-service-llama-3-70b-ingress
+
+sh ./tf.sh -e prod -a import module.llm-inference-service-set-us-west1[0].module.llm-inference-service-gcs-filestore-transfer-agent.module.storage-transfer-agent-gke-service.kubernetes_deployment.kubernetes_app_deployment apps-llm-ns/llm-inference-service-mta
+
+sh ./tf.sh -e prod -a import module.llm-inference-service-set-us-west1[0].module.llm-inference-service[0].module.llm-inference-service.kubernetes_deployment.kubernetes_app_deployment apps-llm-ns/llm-inference-service-llama-3-70b
+
+sh ./tf.sh -e prod -a import module.llm-inference-service-set-us-west1[0].module.llm-inference-service-gcs-filestore-transfer-agent.module.storage-transfer-agent-gke-service.kubernetes_service_v1.service_private_lb apps-llm-ns/llm-inference-service-mta-http-server
+
+sh ./tf.sh -e prod -a import module.llm-inference-service-set-us-west1[0].module.llm-inference-service[0].module.llm-inference-service.kubernetes_service_v1.service_private_lb apps-llm-ns/llm-inference-service-llama-3-70b-http-server
+
+sh ./tf.sh -e prod -a import module.llm-inference-service-set-us-west1[0].module.llm-inference-service-gcs-filestore-transfer-agent.module.storage-transfer-agent-gke-service.kubernetes_service_v1.service_node_port apps-llm-ns/llm-inference-service-mta-nodeport
+
+sh ./tf.sh -e prod -a import module.llm-inference-service-set-us-west1[0].module.llm-inference-service[0].module.llm-inference-service.kubernetes_service_v1.service_node_port apps-llm-ns/llm-inference-service-llama-3-70b-nodeport
+
+

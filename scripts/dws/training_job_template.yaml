@@ -1,0 +1,69 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  annotations:
+    provreq.kueue.x-k8s.io/maxRunDurationSeconds: "14400"
+  labels:
+    kueue.x-k8s.io/queue-name: dws-local-queue
+  name: {{ job_name }}
+  namespace: apps-services-ns
+spec:
+  backoffLimit: 2
+  # Fail the job immediately if it exists with non-zero code
+  podFailurePolicy:
+    rules:
+    - action: FailJob
+      onExitCodes:
+        operator: NotIn
+        values: [0]
+  completionMode: NonIndexed
+  completions: 1
+  parallelism: 1
+  podReplacementPolicy: Failed
+  suspend: true
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+    spec:
+      containers:
+      - args:
+        command:
+        - bin/run_fine_tuning_dws.sh
+        env:
+        - name: ORG_SHORT_NAME 
+          value: {{ org_short_name }}
+        - name: DATE
+          value: {{ date }}
+        image: us-docker.pkg.dev/spiffy-prod/spiffy/scli:v1.0.4
+        imagePullPolicy: IfNotPresent
+        name: {{ job_name }}
+        volumeMounts:
+        - name: spiffy-train-data-volume
+          mountPath: /spiffy-train-dev
+        resources:
+          limits:
+            cpu: "128"
+            memory: 1000Gi
+            nvidia.com/gpu: 8
+          requests:
+            cpu: "128"
+            memory: 1000Gi
+            nvidia.com/gpu: 8
+      dnsPolicy: ClusterFirst
+      nodeSelector:
+        cloud.google.com/gke-accelerator: nvidia-h100-80gb
+      restartPolicy: Never
+      schedulerName: default-scheduler
+      securityContext: {}
+      serviceAccount: model-train-job-k8-sa
+      serviceAccountName: model-train-job-k8-sa
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - effect: NoSchedule
+        key: nvidia.com/gpu
+        operator: Exists
+      volumes:
+      - name: spiffy-train-data-volume
+        persistentVolumeClaim:
+          claimName: model-train-job-gcs-pvc

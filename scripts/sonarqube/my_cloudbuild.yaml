@@ -1,0 +1,17 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '--build-arg'
+      - 'SONARQUBE_SCANNER_CLI_VERSION=5.0.1.3006'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/sonar-scanner:latest'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/sonar-scanner:5.0.1.3006'
+      - '.'
+
+images:
+  - 'gcr.io/$PROJECT_ID/sonar-scanner:latest'
+  - 'gcr.io/$PROJECT_ID/sonar-scanner:5.0.1.3006'
+
+tags: ['cloud-builders-community']

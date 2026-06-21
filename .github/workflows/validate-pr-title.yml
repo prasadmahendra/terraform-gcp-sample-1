@@ -1,0 +1,25 @@
+name: Validate PR Title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+jobs:
+  validate-pr-title:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check PR title format
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          echo "PR Title: $PR_TITLE"
+
+          pattern='^[A-Z]+-[0-9]+ .+'
+
+          if [[ ! "$PR_TITLE" =~ $pattern ]]; then
+            echo "❌ ERROR: Pull request title must match the pattern: TICKET-123 Description (or ENG-0 Description for small drive-bys)"
+            exit 1
+          else
+            echo "✅ PR title is valid."
+          fi

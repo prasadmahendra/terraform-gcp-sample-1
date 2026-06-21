@@ -1,0 +1,1369 @@
+version: 2.1
+
+orbs:
+  slack: circleci/slack@6.0.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline parameters — used to trigger specific environment applies.
+#
+# Trigger a terraform apply via the CircleCI API:
+#   POST https://circleci.com/api/v2/project/github/spiffy-ai/terraform/pipeline
+#   Body: {"parameters": {"apply-environment": "central", "dry-run-only": false}}
+#
+# Add "refresh": true to reconcile drift against real infra (slower, matches a
+# local plan). Default is false — the fast path that compares config vs state.
+#
+# Add "tf-targets" to scope plan/apply to specific resources — a space-separated
+# list of Terraform addresses, mirroring `tf.sh -t`. Example (single resource):
+#   {"parameters": {"apply-environment": "prod",
+#     "tf-targets": "module.cdc-main-db[0].module.cdc-stream-topics[4].google_pubsub_topic.topic"}}
+# A scoped run skips the changed-paths gate (like a scheduled run) so it works
+# even when the last commit didn't touch deployment paths. -target is Terraform's
+# escape hatch for surgical fixes/drift — not for routine deploys.
+#
+# Or from the CircleCI UI: Pipelines → Trigger Pipeline → Add Parameters
+# ─────────────────────────────────────────────────────────────────────────────
+parameters:
+  apply-environment:
+    type: enum
+    enum: ["", "dev", "prod", "central"]
+    default: ""
+  dry-run-only:
+    description: "Run auth/init/plan only — skip apply (mirrors dry_run_only in Actions)"
+    type: boolean
+    default: false
+  scheduled-run:
+    description: >-
+      Set by the weekly Scheduled Pipeline. When true, the prod plan/apply runs
+      regardless of whether the last commit touched deployment paths (the plan's
+      detailed-exitcode still skips if there is genuinely nothing to apply).
+    type: boolean
+    default: false
+  refresh:
+    description: >-
+      Controls `terraform plan -refresh`. Default false keeps the fast path
+      (plan compares config against the stored state, skipping provider API
+      calls). Set true to reconcile drift on managed resources against real
+      infrastructure — slower, but produces the same diff a local plan would.
+      Intended for the weekly drift-reconciliation run. NOTE: refresh does not
+      import resources that were never in the state; that still needs `import`.
+    type: boolean
+    default: false
+  tf-targets:
+    description: >-
+      Optional space-separated list of Terraform resource addresses to scope
+      plan/apply to (mirrors `tf.sh -t`). Empty = full-scope plan. When set, the
+      changed-paths gate is bypassed and every plan in the run is restricted to
+      these addresses via repeated `-target=` flags. -target is an escape hatch
+      for surgical fixes/drift — Terraform itself warns it is not for routine use.
+    type: string
+    default: ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Weekly scheduled prod deploy — Wednesdays at 10:00 US Pacific
+#
+# Created as a CircleCI *Scheduled Pipeline*. It is NOT defined in this file —
+# create it once via the API. CircleCI timetables run in UTC ONLY (no timezone
+# field), so 10:00 Pacific is:
+#     18:00 UTC during PST (winter)   ← value used below; matches "10am PST"
+#     17:00 UTC during PDT (summer)   ← lands at 11:00 local unless you switch
+# Pick one. To keep 10:00 local year-round you must update the schedule twice a
+# year (or run two schedules and accept one firing an hour off).
+#
+#   curl -X POST https://circleci.com/api/v2/project/github/spiffy-ai/terraform/schedule \
+#     -H "Circle-Token: $CIRCLE_TOKEN" -H "Content-Type: application/json" -d '{
+#       "name": "weekly-prod-apply",
+#       "description": "Wed 10:00 PST (18:00 UTC) — plan prod, hold for approval",
+#       "attribution-actor": "system",
+#       "parameters": {
+#         "branch": "main",
+#         "apply-environment": "prod",
+#         "scheduled-run": true
+#       },
+#       "timetable": {
+#         "per-hour": 1, "hours-of-day": [18], "days-of-week": ["WED"]
+#       }
+#     }'
+#
+# This triggers the existing `apply-prod` workflow, which still requires a human
+# to approve `hold-prod` before `apply-prod` runs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Executors
+# ─────────────────────────────────────────────────────────────────────────────
+executors:
+  tf-gcloud:
+    docker:
+      - image: google/cloud-sdk:slim
+    environment:
+      TF_VERSION: "1.13.4"
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      GODEBUG: "asyncpreemptoff=1"
+      # Raw value of the tf-targets pipeline parameter. CircleCI assigns env
+      # values directly (no shell eval), so this is injection-safe even though
+      # the parameter is free-form. build-tf-targets expands it into -target
+      # flags; the change-detection steps read it to bypass the changed-paths gate.
+      TF_TARGETS_RAW: << pipeline.parameters.tf-targets >>
+    working_directory: ~/repo
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reusable commands
+# ─────────────────────────────────────────────────────────────────────────────
+commands:
+
+  # ── Build -target flags from the tf-targets parameter ───────────────────────
+  # Expands $TF_TARGETS_RAW (the raw tf-targets pipeline parameter, set on the
+  # executor) into a TF_TARGETS_ARGS bash array of `-target=` flags, persisted
+  # via $BASH_ENV for the plan steps that follow. Empty when no targets are set,
+  # so plans run full-scope by default. Call this once before each Terraform Plan.
+  # Plan steps must expand it as "${TF_TARGETS_ARGS[@]}" to keep each address
+  # intact — Terraform addresses contain glob metacharacters (e.g. [0], [*])
+  # that unquoted expansion would word-split and pathname-expand.
+  build-tf-targets:
+    steps:
+      - run:
+          name: Build -target flags from tf-targets parameter
+          command: |
+            # Disable pathname expansion so address globs ([0], [*]) survive the
+            # word-split of the space-separated list below.
+            set -f
+            TF_TARGETS_ARGS=()
+            for addr in $TF_TARGETS_RAW; do
+              TF_TARGETS_ARGS+=("-target=$addr")
+            done
+            set +f
+            if [ ${#TF_TARGETS_ARGS[@]} -gt 0 ]; then
+              echo "⚠️  Scoped run — Terraform will target only: ${TF_TARGETS_ARGS[*]}"
+            else
+              echo "No tf-targets set — full-scope plan"
+            fi
+            # Persist as a properly-quoted array declaration so each -target flag
+            # is preserved exactly when re-sourced by later plan steps.
+            declare -p TF_TARGETS_ARGS >> "$BASH_ENV"
+
+  # ── Install Terraform ───────────────────────────────────────────────────────
+  install-terraform:
+    steps:
+      - run:
+          name: Install Terraform
+          command: |
+            apt-get update -qq
+            apt-get install -y -qq unzip
+            curl -fsSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" \
+              -o /tmp/tf.zip
+            EXPECTED_SHA=$(curl -fsSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_SHA256SUMS" \
+              | grep "linux_amd64.zip" | awk '{print $1}')
+            echo "${EXPECTED_SHA}  /tmp/tf.zip" | sha256sum -c
+            unzip -q /tmp/tf.zip -d /usr/local/bin/
+            rm /tmp/tf.zip
+            terraform version
+
+  # ── Authenticate to GCP via CircleCI OIDC → Workload Identity Federation ───
+  #
+  # $CIRCLE_OIDC_TOKEN is automatically available in all CircleCI jobs.
+  # This command exchanges it for short-lived GCP credentials via WIF — no
+  # static service account keys are stored anywhere.
+  #
+  # Required context variables (set in the "terraform" CircleCI context):
+  #   CCI_WIF_PROVIDER_DEV / PROD / CENTRAL  — output from circleci_wif.tf
+  #   SA_EMAIL_DEV / PROD / CENTRAL          — same as used in GitHub Actions
+  # ─────────────────────────────────────────────────────────────────────────
+  auth-gcp:
+    parameters:
+      wif-provider-var:
+        type: string
+        description: "Name of env var holding the CCI WIF provider resource name"
+      sa-email-var:
+        type: string
+        description: "Name of env var holding the GCP service account email"
+    steps:
+      - run:
+          name: Authenticate to GCP (CircleCI OIDC → WIF)
+          command: |
+            # Indirect variable expansion: get value from named env var
+            WIF_PROVIDER_NAME="<< parameters.wif-provider-var >>"
+            SA_EMAIL_NAME="<< parameters.sa-email-var >>"
+            WIF_PROVIDER="${!WIF_PROVIDER_NAME}"
+            SA_EMAIL="${!SA_EMAIL_NAME}"
+
+            if [ -z "$WIF_PROVIDER" ] || [ -z "$SA_EMAIL" ]; then
+              echo "ERROR: ${WIF_PROVIDER_NAME} or ${SA_EMAIL_NAME} not set in CircleCI context 'terraform'" >&2
+              exit 1
+            fi
+            if [ -z "$CIRCLE_OIDC_TOKEN" ]; then
+              echo "ERROR: CIRCLE_OIDC_TOKEN is empty — ensure the project has OIDC enabled" >&2
+              exit 1
+            fi
+
+            echo "$CIRCLE_OIDC_TOKEN" > /tmp/circleci_oidc_token
+
+            cat > /tmp/gcp_wif_creds.json \<<EOF
+            {
+              "type": "external_account",
+              "audience": "//iam.googleapis.com/${WIF_PROVIDER}",
+              "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+              "token_url": "https://sts.googleapis.com/v1/token",
+              "credential_source": {
+                "file": "/tmp/circleci_oidc_token"
+              },
+              "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${SA_EMAIL}:generateAccessToken",
+              "service_account_impersonation": {
+                "token_lifetime_seconds": 3600
+              }
+            }
+            EOF
+
+            gcloud auth login --cred-file=/tmp/gcp_wif_creds.json --quiet
+            echo "export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp_wif_creds.json" >> "$BASH_ENV"
+
+  # ── Configure AWS profile (dev — placeholder creds are fine; no Route53) ───
+  setup-aws:
+    steps:
+      - run:
+          name: Configure AWS profile (spiffy-prod)
+          command: |
+            mkdir -p ~/.aws
+            printf '[profile spiffy-prod]\nregion = us-west-2\n' > ~/.aws/config
+            # Dev has no Route53 resources (count = env == "prod" ? 1 : 0),
+            # so placeholder creds work when skip_credentials_validation=true.
+            printf '[spiffy-prod]\naws_access_key_id = %s\naws_secret_access_key = %s\n' \
+              "${AWS_ACCESS_KEY_ID_PROD:-AKIAIOSFODNN7EXAMPLE}" \
+              "${AWS_SECRET_ACCESS_KEY_PROD:-wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY}" \
+              > ~/.aws/credentials
+
+  # ── Configure AWS profile (prod — real credentials required for Route53) ───
+  setup-aws-prod:
+    steps:
+      - run:
+          name: Configure AWS profile (spiffy-prod — real credentials required)
+          command: |
+            if [ -z "$AWS_ACCESS_KEY_ID_PROD" ] || [ -z "$AWS_SECRET_ACCESS_KEY_PROD" ]; then
+              echo "ERROR: Missing AWS_ACCESS_KEY_ID_PROD or AWS_SECRET_ACCESS_KEY_PROD in context" >&2
+              exit 1
+            fi
+            mkdir -p ~/.aws
+            printf '[profile spiffy-prod]\nregion = us-west-2\n' > ~/.aws/config
+            printf '[spiffy-prod]\naws_access_key_id = %s\naws_secret_access_key = %s\n' \
+              "$AWS_ACCESS_KEY_ID_PROD" "$AWS_SECRET_ACCESS_KEY_PROD" > ~/.aws/credentials
+
+  # ── Pull secrets from GCP Secret Manager → secrets.tfvars ─────────────────
+  # GCP_PROJECT_ID must be set in the job's environment block.
+  build-secrets-tfvars:
+    parameters:
+      working-dir:
+        type: string
+    steps:
+      - run:
+          name: Build secrets.tfvars from Secret Manager
+          working_directory: << parameters.working-dir >>
+          command: |
+            get_secret() {
+              local value
+              value=$(gcloud secrets versions access latest \
+                --secret="$1" --project="$GCP_PROJECT_ID" 2>&1) || {
+                echo "ERROR: Failed to retrieve secret '$1': $value" >&2
+                exit 1
+              }
+              [ -z "$value" ] && { echo "ERROR: Secret '$1' returned empty" >&2; exit 1; }
+              echo "$value"
+            }
+            cat > secrets.tfvars \<<EOF
+            datadog_api_key             = "$(get_secret datadog_api_key)"
+            datadog_app_key             = "$(get_secret datadog_app_key)"
+            elasticsearch_cloud_api_key = "$(get_secret elasticsearch_cloud_api_key)"
+            EOF
+
+  # ── Detect changed files and initialize the workspace slot ────────────────
+  # Uses git diff to determine if relevant paths changed:
+  #   - On a PR branch: diff against origin/main
+  #   - On main: diff HEAD~1 (covers squash-merges; update if using merge commits)
+  #
+  # Creates /tmp/plan-results/<env>/ with a .skipped marker when no changes
+  # are detected so that post-pr-comment can show "Skipped" sections.
+  # The first persist_to_workspace call in each plan job always runs (before any
+  # possible circleci step halt) to ensure the workspace slot exists.
+  detect-changes-and-init-workspace:
+    parameters:
+      env:
+        type: string
+        description: "Environment label used as the workspace subdirectory name"
+      paths-pattern:
+        type: string
+        description: "grep -E pattern of relevant paths (e.g. '^(deployment|modules|environments)/')"
+    steps:
+      - run:
+          name: Detect changes for << parameters.env >>
+          command: |
+            mkdir -p /tmp/plan-results/<< parameters.env >>
+
+            if [ "$CIRCLE_BRANCH" = "main" ]; then
+              CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "ALL")
+            else
+              git fetch origin main --depth=1 2>/dev/null || true
+              CHANGED=$(git diff --name-only origin/main...HEAD 2>/dev/null || echo "ALL")
+            fi
+
+            if [ "$CHANGED" = "ALL" ] || echo "$CHANGED" | grep -qE '<< parameters.paths-pattern >>'; then
+              echo "true" > /tmp/plan-results/<< parameters.env >>/.has_changes
+              echo "Relevant changes detected for << parameters.env >>"
+            else
+              echo "false" > /tmp/plan-results/<< parameters.env >>/.has_changes
+              echo "skipped" > /tmp/plan-results/<< parameters.env >>/plan-outcome.txt
+              echo "Skipped — no relevant changes detected" \
+                > /tmp/plan-results/<< parameters.env >>/plan-summary.txt
+              echo "No relevant changes for << parameters.env >> — will skip plan"
+            fi
+
+  # ── Extract plan diff and persist results to workspace ────────────────────
+  save-plan-results:
+    parameters:
+      env:
+        type: string
+      plan-dir:
+        type: string
+        description: "Directory containing plan-output.txt"
+    steps:
+      - run:
+          name: Save plan results (<< parameters.env >>)
+          when: always
+          command: |
+            DIR="<< parameters.plan-dir >>"
+            DEST="/tmp/plan-results/<< parameters.env >>"
+            mkdir -p "$DEST"
+
+            if [ -f "${DIR}/plan-output.txt" ]; then
+              cp "${DIR}/plan-output.txt" "${DEST}/plan-output.txt"
+
+              SUMMARY=$(grep -E "Plan:|No changes\." "${DIR}/plan-output.txt" | tail -1)
+              echo "${SUMMARY:-Unable to determine plan result}" > "${DEST}/plan-summary.txt"
+
+              if grep -q "Terraform used the selected providers" "${DIR}/plan-output.txt"; then
+                sed -n '/Terraform used the selected providers/,$p' "${DIR}/plan-output.txt" \
+                  > "${DIR}/plan-diff.txt"
+              elif grep -q "Planning failed\." "${DIR}/plan-output.txt"; then
+                sed -n '/Planning failed\./,$p' "${DIR}/plan-output.txt" \
+                  > "${DIR}/plan-diff.txt"
+              else
+                cp "${DIR}/plan-output.txt" "${DIR}/plan-diff.txt"
+              fi
+              head -c 20000 "${DIR}/plan-diff.txt" > "${DEST}/plan-diff-truncated.txt"
+            fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Jobs
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Plan: deployment/dev
+  # ═══════════════════════════════════════════════════════════════════════════
+  plan-dev:
+    executor: tf-gcloud
+    environment:
+      GCP_PROJECT_ID: spiffy-ai-dev
+      GCP_REGION: us-west1
+    steps:
+      - checkout
+
+      - detect-changes-and-init-workspace:
+          env: dev
+          paths-pattern: "^(deployment|modules|environments)/"
+
+      # Persist the initial slot (skipped marker or .has_changes flag) so the
+      # workspace exists for post-pr-comment even if this job halts early.
+      - persist_to_workspace:
+          root: /tmp/plan-results
+          paths:
+            - dev
+
+      - run:
+          name: Skip if no deployment changes
+          command: |
+            # A scoped (tf-targets) run always plans, even with no changed paths.
+            if [ -z "$TF_TARGETS_RAW" ] && [ "$(cat /tmp/plan-results/dev/.has_changes)" != "true" ]; then
+              circleci step halt
+            fi
+
+      - install-terraform
+      - auth-gcp:
+          wif-provider-var: CCI_WIF_PROVIDER_DEV
+          sa-email-var: SA_EMAIL_DEV
+      - run:
+          name: Configure gcloud project
+          command: gcloud config set project "$GCP_PROJECT_ID"
+      - run:
+          name: Install gke-gcloud-auth-plugin
+          command: apt-get update -qq && apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin
+      - run:
+          name: Authenticate to GKE clusters (dev)
+          command: |
+            gcloud container clusters get-credentials gke-default \
+              --region "$GCP_REGION" --project "$GCP_PROJECT_ID"
+            gcloud container clusters get-credentials gke-dws-secondary-region \
+              --region us-central1 --project "$GCP_PROJECT_ID"
+      - setup-aws
+      - build-secrets-tfvars:
+          working-dir: ~/repo/environments/dev
+      - run:
+          name: Terraform Init (dev)
+          working_directory: ~/repo/deployment
+          command: |
+            export TF_DATA_DIR="../environments/dev/.terraform"
+            terraform init -backend-config=../environments/dev/backend.tfvars
+      - build-tf-targets
+      - run:
+          name: Terraform Plan (dev)
+          working_directory: ~/repo/deployment
+          command: |
+            export TF_DATA_DIR="../environments/dev/.terraform"
+            set +e
+            terraform plan \
+              "${TF_TARGETS_ARGS[@]}" \
+              -lock-timeout=90s \
+              -var-file=../environments/dev/terraform.tfvars \
+              -var-file=../environments/dev/secrets.tfvars \
+              -no-color \
+              -out=tfplan-dev 2>&1 | tee plan-output.txt
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+
+            if [ "$PLAN_EXIT" -eq 0 ]; then
+              echo "success" > /tmp/plan-results/dev/plan-outcome.txt
+            else
+              echo "failure" > /tmp/plan-results/dev/plan-outcome.txt
+            fi
+            # Always exit 0 — plan failures reported via PR comment
+
+      - save-plan-results:
+          env: dev
+          plan-dir: deployment
+
+      - persist_to_workspace:
+          when: always
+          root: /tmp/plan-results
+          paths:
+            - dev
+
+      - store_artifacts:
+          when: always
+          path: ~/repo/deployment/plan-output.txt
+          destination: plan-dev/plan-output.txt
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Plan: deployment/prod
+  # ═══════════════════════════════════════════════════════════════════════════
+  plan-prod:
+    executor: tf-gcloud
+    environment:
+      GCP_PROJECT_ID: spiffy-prod
+      GCP_REGION: us-central1
+    steps:
+      - checkout
+
+      - detect-changes-and-init-workspace:
+          env: prod
+          paths-pattern: "^(deployment|modules|environments)/"
+
+      - persist_to_workspace:
+          root: /tmp/plan-results
+          paths:
+            - prod
+
+      - run:
+          name: Skip if no deployment changes
+          command: |
+            # A scoped (tf-targets) run always plans, even with no changed paths.
+            if [ -z "$TF_TARGETS_RAW" ] && [ "$(cat /tmp/plan-results/prod/.has_changes)" != "true" ]; then
+              circleci step halt
+            fi
+
+      - install-terraform
+      - auth-gcp:
+          wif-provider-var: CCI_WIF_PROVIDER_PROD
+          sa-email-var: SA_EMAIL_PROD
+      - run:
+          name: Configure gcloud project
+          command: gcloud config set project "$GCP_PROJECT_ID"
+      - run:
+          name: Install gke-gcloud-auth-plugin
+          command: apt-get update -qq && apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin
+      - run:
+          name: Authenticate to GKE clusters (prod)
+          command: |
+            gcloud container clusters get-credentials gke-default \
+              --region "$GCP_REGION" --project "$GCP_PROJECT_ID"
+            gcloud container clusters get-credentials gke-dws-primary-region \
+              --region "$GCP_REGION" --project "$GCP_PROJECT_ID"
+            gcloud container clusters get-credentials gke-us-west1 \
+              --region us-west1 --project "$GCP_PROJECT_ID"
+      - setup-aws-prod
+      - build-secrets-tfvars:
+          working-dir: ~/repo/environments/prod
+      - run:
+          name: Terraform Init (prod)
+          working_directory: ~/repo/deployment
+          command: |
+            export TF_DATA_DIR="../environments/prod/.terraform"
+            terraform init -backend-config=../environments/prod/backend.tfvars
+      - build-tf-targets
+      - run:
+          name: Terraform Plan (prod)
+          working_directory: ~/repo/deployment
+          command: |
+            export TF_DATA_DIR="../environments/prod/.terraform"
+            set +e
+            terraform plan \
+              "${TF_TARGETS_ARGS[@]}" \
+              -lock-timeout=90s \
+              -var-file=../environments/prod/terraform.tfvars \
+              -var-file=../environments/prod/secrets.tfvars \
+              -no-color \
+              -out=tfplan-prod 2>&1 | tee plan-output.txt
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+
+            if [ "$PLAN_EXIT" -eq 0 ]; then
+              echo "success" > /tmp/plan-results/prod/plan-outcome.txt
+            else
+              echo "failure" > /tmp/plan-results/prod/plan-outcome.txt
+            fi
+            # Always exit 0 — plan failures reported via PR comment
+
+      - save-plan-results:
+          env: prod
+          plan-dir: deployment
+
+      - persist_to_workspace:
+          when: always
+          root: /tmp/plan-results
+          paths:
+            - prod
+
+      - store_artifacts:
+          when: always
+          path: ~/repo/deployment/plan-output.txt
+          destination: plan-prod/plan-output.txt
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Plan: central
+  # ═══════════════════════════════════════════════════════════════════════════
+  plan-central:
+    executor: tf-gcloud
+    environment:
+      GCP_PROJECT_ID: spiffy-central
+    steps:
+      - checkout
+
+      - detect-changes-and-init-workspace:
+          env: central
+          paths-pattern: "^central/"
+
+      - persist_to_workspace:
+          root: /tmp/plan-results
+          paths:
+            - central
+
+      - run:
+          name: Skip if no central changes
+          command: |
+            # A scoped (tf-targets) run always plans, even with no changed paths.
+            if [ -z "$TF_TARGETS_RAW" ] && [ "$(cat /tmp/plan-results/central/.has_changes)" != "true" ]; then
+              circleci step halt
+            fi
+
+      - install-terraform
+      - auth-gcp:
+          wif-provider-var: CCI_WIF_PROVIDER_CENTRAL
+          sa-email-var: SA_EMAIL_CENTRAL
+      - run:
+          name: Configure gcloud project
+          command: gcloud config set project "$GCP_PROJECT_ID"
+      - run:
+          name: Terraform Init (central)
+          working_directory: ~/repo/central
+          command: terraform init
+      - build-tf-targets
+      - run:
+          name: Terraform Plan (central)
+          working_directory: ~/repo/central
+          command: |
+            set +e
+            # Use -refresh=false to skip Cloud Identity API calls that fail with 403 during bootstrap.
+            # This PR grants cloudidentity.groups.reader via central/github_actions_wif.tf;
+            # once this PR is merged and applied, -refresh=false can be removed.
+            terraform plan \
+              "${TF_TARGETS_ARGS[@]}" \
+              -lock-timeout=90s \
+              -refresh=false \
+              -var-file=terraform.tfvars \
+              -no-color \
+              -out=tfplan-central 2>&1 | tee plan-output.txt
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+
+            if [ "$PLAN_EXIT" -eq 0 ]; then
+              echo "success" > /tmp/plan-results/central/plan-outcome.txt
+            else
+              echo "failure" > /tmp/plan-results/central/plan-outcome.txt
+            fi
+            # Always exit 0 — plan failures reported via PR comment
+
+      - save-plan-results:
+          env: central
+          plan-dir: central
+
+      - persist_to_workspace:
+          when: always
+          root: /tmp/plan-results
+          paths:
+            - central
+
+      - store_artifacts:
+          when: always
+          path: ~/repo/central/plan-output.txt
+          destination: plan-central/plan-output.txt
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Post Terraform plan results as a PR comment
+  #
+  # Uses the GitHub API with $GITHUB_TOKEN (a PAT or GitHub App token stored in
+  # the "terraform" context) to create or update a comment on the PR.
+  # Finds an existing comment by body content so the comment is updated in-place
+  # on subsequent pushes rather than duplicated.
+  # ═══════════════════════════════════════════════════════════════════════════
+  post-pr-comment:
+    executor: tf-gcloud
+    steps:
+      - attach_workspace:
+          at: /tmp/plan-results
+
+      - run:
+          name: Write comment script
+          command: |
+            cat > /tmp/post_comment.py \<<'PYEOF'
+            import os, json, pathlib, sys, urllib.request, urllib.error
+
+            def read_file(path, default=""):
+                try:
+                    return pathlib.Path(path).read_text().strip()
+                except Exception:
+                    return default
+
+            def build_section(env, name):
+                base = pathlib.Path(f"/tmp/plan-results/{env}")
+                outcome = read_file(base / "plan-outcome.txt")
+                summary = read_file(base / "plan-summary.txt")
+                diff_path = base / "plan-diff-truncated.txt"
+                diff = diff_path.read_text() if diff_path.exists() else ""
+
+                if not outcome or outcome == "skipped":
+                    return f"### {name}\n⏭️ Skipped (no relevant changes detected)\n\n"
+
+                icon = "✅" if outcome == "success" else "❌"
+                s  = f"### {name} {icon}\n"
+                s += f"**Summary:** {summary}\n\n"
+                s += "<details><summary>Show Plan Output</summary>\n\n```terraform\n"
+                s += diff or "(no output captured)"
+                s += "\n```\n</details>\n\n"
+                return s
+
+            pr_number = os.environ.get("PR_NUMBER", "").strip()
+            token     = os.environ.get("GITHUB_TOKEN", "")
+            build_url = os.environ.get("CIRCLE_BUILD_URL", "")
+
+            # Parse owner/repo from CIRCLE_PULL_REQUEST URL
+            # (e.g. https://github.com/spiffy-ai/terraform/pull/333)
+            # CIRCLE_PROJECT_USERNAME may contain the CircleCI org display name
+            # ("Envive AI") rather than the GitHub slug ("spiffy-ai").
+            import re as _re
+            _pr_url = os.environ.get("CIRCLE_PULL_REQUEST", "")
+            _repo_url = os.environ.get("CIRCLE_REPOSITORY_URL", "")
+            _m = _re.search(r'github\.com/([^/]+)/([^/]+)/pull/', _pr_url) or \
+                 _re.search(r'github\.com[:/]([^/]+)/([^/.]+)', _repo_url)
+            owner = _m.group(1) if _m else os.environ.get("CIRCLE_PROJECT_USERNAME", "")
+            repo  = _m.group(2) if _m else os.environ.get("CIRCLE_PROJECT_REPONAME", "")
+            print(f"GitHub target: {owner}/{repo}")
+
+            if not pr_number or not token:
+                print("PR_NUMBER or GITHUB_TOKEN not set — skipping comment")
+                sys.exit(0)
+
+            body  = "## Terraform Plan Results\n\n"
+            body += build_section("dev",     "deployment/dev")
+            body += build_section("prod",    "deployment/prod")
+            body += build_section("central", "central")
+            body += f"---\n📋 [Full plan logs (artifacts)]({build_url})\n"
+
+            headers = {
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github.v3+json",
+                "Content-Type": "application/json",
+                "User-Agent": "circleci-terraform-bot/1.0",
+            }
+
+            # Look for an existing Terraform plan comment to update in-place
+            list_url = (
+                f"https://api.github.com/repos/{owner}/{repo}"
+                f"/issues/{pr_number}/comments?per_page=100"
+            )
+            try:
+                req = urllib.request.Request(list_url, headers=headers)
+                with urllib.request.urlopen(req) as r:
+                    comments = json.loads(r.read())
+            except Exception as e:
+                print(f"Warning: could not list PR comments: {e}")
+                comments = []
+
+            existing_id = None
+            for c in comments:
+                if "Terraform Plan Results" in c.get("body", ""):
+                    existing_id = c["id"]
+                    break
+
+            payload = json.dumps({"body": body}).encode("utf-8")
+
+            if existing_id:
+                url = (
+                    f"https://api.github.com/repos/{owner}/{repo}"
+                    f"/issues/comments/{existing_id}"
+                )
+                req = urllib.request.Request(url, data=payload, headers=headers, method="PATCH")
+                print(f"Updating existing comment {existing_id} on PR #{pr_number}")
+            else:
+                url = (
+                    f"https://api.github.com/repos/{owner}/{repo}"
+                    f"/issues/{pr_number}/comments"
+                )
+                req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+                print(f"Creating comment on PR #{pr_number}")
+
+            try:
+                with urllib.request.urlopen(req) as r:
+                    print(f"Done — HTTP {r.status}")
+            except urllib.error.HTTPError as e:
+                print(f"HTTP error {e.code}: {e.reason}")
+                print(e.read().decode("utf-8", errors="replace"))
+                sys.exit(1)
+            PYEOF
+
+      - run:
+          name: Post plan comment on PR
+          command: |
+            if [ -z "$CIRCLE_PULL_REQUEST" ]; then
+              echo "Not a PR build — skipping comment"
+            else
+              export PR_NUMBER
+              PR_NUMBER=$(echo "$CIRCLE_PULL_REQUEST" | grep -oE '[0-9]+$')
+              python3 /tmp/post_comment.py
+            fi
+
+            # Report plan outcomes in output — visible in CCI job log.
+            # The pipeline passes regardless (mirrors GHA continue-on-error: true).
+            # Plan failures are communicated via the PR comment ❌/✅ icons.
+            echo "=== Plan outcomes ==="
+            for f in /tmp/plan-results/*/plan-outcome.txt; do
+              ENV=$(basename "$(dirname "$f")")
+              echo "  $ENV: $(cat "$f" 2>/dev/null || echo 'not found')"
+            done
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Plan: deployment/dev  (pre-apply — surfaces diff before approval gate)
+  # ═══════════════════════════════════════════════════════════════════════════
+  plan-dev-apply:
+    executor: tf-gcloud
+    environment:
+      GCP_PROJECT_ID: spiffy-ai-dev
+      GCP_REGION: us-west1
+    steps:
+      - checkout
+      - run:
+          name: Detect deployment changes
+          command: |
+            if [ -n "$TF_TARGETS_RAW" ]; then
+              echo "Scoped-target run — proceeding regardless of changed paths"
+            else
+              CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "ALL")
+              if [ "$CHANGED" = "ALL" ] || echo "$CHANGED" | grep -qE '^(deployment|modules|environments)/'; then
+                echo "Deployment changes detected"
+              else
+                echo "No deployment changes — skipping dev plan/apply"
+                circleci step halt
+              fi
+            fi
+      - install-terraform
+      - auth-gcp:
+          wif-provider-var: CCI_WIF_PROVIDER_DEV
+          sa-email-var: SA_EMAIL_DEV
+      - run:
+          name: Configure gcloud project
+          command: gcloud config set project "$GCP_PROJECT_ID"
+      - run:
+          name: Install gke-gcloud-auth-plugin
+          command: apt-get update -qq && apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin
+      - run:
+          name: Authenticate to GKE clusters (dev)
+          command: |
+            gcloud container clusters get-credentials gke-default \
+              --region "$GCP_REGION" --project "$GCP_PROJECT_ID"
+            gcloud container clusters get-credentials gke-dws-secondary-region \
+              --region us-central1 --project "$GCP_PROJECT_ID"
+      - setup-aws
+      - build-secrets-tfvars:
+          working-dir: ~/repo/environments/dev
+      - run:
+          name: Terraform Init (dev)
+          working_directory: ~/repo/deployment
+          command: |
+            export TF_DATA_DIR="../environments/dev/.terraform"
+            terraform init -backend-config=../environments/dev/backend.tfvars
+      - build-tf-targets
+      - run:
+          name: Terraform Plan (dev)
+          working_directory: ~/repo/deployment
+          command: |
+            export TF_DATA_DIR="../environments/dev/.terraform"
+            set +e
+            terraform plan \
+              "${TF_TARGETS_ARGS[@]}" \
+              -var-file=../environments/dev/terraform.tfvars \
+              -var-file=../environments/dev/secrets.tfvars \
+              -no-color \
+              -refresh=<< pipeline.parameters.refresh >> \
+              -lock-timeout=5m \
+              -detailed-exitcode \
+              -out=tfplan-dev 2>&1 | tee plan-output.txt
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+
+            if [ "$PLAN_EXIT" -eq 1 ]; then
+              echo "Terraform plan failed" >&2; exit 1
+            elif [ "$PLAN_EXIT" -eq 0 ]; then
+              echo "No changes detected in dev"
+              circleci step halt
+            else
+              echo "⚠️  Changes detected in dev — approval required"
+            fi
+      - store_artifacts:
+          path: ~/repo/deployment/plan-output.txt
+          destination: plan-dev-apply/plan-output.txt
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Apply: deployment/dev
+  # Runs after manual approval in the CircleCI UI.
+  # Re-plans before applying to guard against state drift during the approval
+  # window (same pattern as apply-prod).
+  # ═══════════════════════════════════════════════════════════════════════════
+  apply-dev:
+    executor: tf-gcloud
+    environment:
+      GCP_PROJECT_ID: spiffy-ai-dev
+      GCP_REGION: us-west1
+    steps:
+      - checkout
+      - install-terraform
+      - auth-gcp:
+          wif-provider-var: CCI_WIF_PROVIDER_DEV
+          sa-email-var: SA_EMAIL_DEV
+      - run:
+          name: Configure gcloud project
+          command: gcloud config set project "$GCP_PROJECT_ID"
+      - run:
+          name: Install gke-gcloud-auth-plugin
+          command: apt-get update -qq && apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin
+      - run:
+          name: Authenticate to GKE clusters (dev)
+          command: |
+            gcloud container clusters get-credentials gke-default \
+              --region "$GCP_REGION" --project "$GCP_PROJECT_ID"
+            gcloud container clusters get-credentials gke-dws-secondary-region \
+              --region us-central1 --project "$GCP_PROJECT_ID"
+      - setup-aws
+      - build-secrets-tfvars:
+          working-dir: ~/repo/environments/dev
+      - run:
+          name: Terraform Init (dev)
+          working_directory: ~/repo/deployment
+          command: |
+            export TF_DATA_DIR="../environments/dev/.terraform"
+            terraform init -backend-config=../environments/dev/backend.tfvars
+      - build-tf-targets
+      - run:
+          name: Terraform Plan (dev) — fresh plan after approval
+          working_directory: ~/repo/deployment
+          command: |
+            export TF_DATA_DIR="../environments/dev/.terraform"
+            terraform plan \
+              "${TF_TARGETS_ARGS[@]}" \
+              -var-file=../environments/dev/terraform.tfvars \
+              -var-file=../environments/dev/secrets.tfvars \
+              -no-color \
+              -refresh=<< pipeline.parameters.refresh >> \
+              -lock-timeout=5m \
+              -out=tfplan-dev 2>&1 | tee plan-output.txt
+      - run:
+          name: Terraform Apply (dev)
+          working_directory: ~/repo/deployment
+          command: |
+            if [ "<< pipeline.parameters.dry-run-only >>" = "true" ]; then
+              echo "dry-run-only=true — skipping apply"
+              exit 0
+            fi
+            export TF_DATA_DIR="../environments/dev/.terraform"
+            terraform apply \
+              -no-color \
+              -lock-timeout=5m \
+              tfplan-dev 2>&1 | tee apply-output.txt
+      - store_artifacts:
+          path: ~/repo/deployment/plan-output.txt
+          destination: apply-dev/plan-output.txt
+      - store_artifacts:
+          path: ~/repo/deployment/apply-output.txt
+          destination: apply-dev/apply-output.txt
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Plan: deployment/prod  (pre-apply — surfaces diff before approval gate)
+  # ═══════════════════════════════════════════════════════════════════════════
+  plan-prod-apply:
+    executor: tf-gcloud
+    environment:
+      GCP_PROJECT_ID: spiffy-prod
+      GCP_REGION: us-central1
+    steps:
+      - checkout
+      - run:
+          name: Detect deployment changes
+          command: |
+            if [ "<< pipeline.parameters.scheduled-run >>" = "true" ] || [ -n "$TF_TARGETS_RAW" ]; then
+              echo "Scheduled or scoped-target run — applying pending prod changes regardless of last commit"
+            else
+              CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "ALL")
+              if [ "$CHANGED" = "ALL" ] || echo "$CHANGED" | grep -qE '^(deployment|modules|environments)/'; then
+                echo "Deployment changes detected"
+              else
+                echo "No deployment changes — skipping prod plan/apply"
+                circleci step halt
+              fi
+            fi
+      - install-terraform
+      - auth-gcp:
+          wif-provider-var: CCI_WIF_PROVIDER_PROD
+          sa-email-var: SA_EMAIL_PROD
+      - run:
+          name: Configure gcloud project
+          command: gcloud config set project "$GCP_PROJECT_ID"
+      - run:
+          name: Install gke-gcloud-auth-plugin
+          command: apt-get update -qq && apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin
+      - run:
+          name: Authenticate to GKE clusters (prod)
+          command: |
+            gcloud container clusters get-credentials gke-default \
+              --region "$GCP_REGION" --project "$GCP_PROJECT_ID"
+            gcloud container clusters get-credentials gke-dws-primary-region \
+              --region "$GCP_REGION" --project "$GCP_PROJECT_ID"
+            gcloud container clusters get-credentials gke-us-west1 \
+              --region us-west1 --project "$GCP_PROJECT_ID"
+      - setup-aws-prod
+      - build-secrets-tfvars:
+          working-dir: ~/repo/environments/prod
+      - run:
+          name: Terraform Init (prod)
+          working_directory: ~/repo/deployment
+          command: |
+            export TF_DATA_DIR="../environments/prod/.terraform"
+            terraform init -backend-config=../environments/prod/backend.tfvars
+      - build-tf-targets
+      - run:
+          name: Terraform Plan (prod)
+          working_directory: ~/repo/deployment
+          command: |
+            export TF_DATA_DIR="../environments/prod/.terraform"
+            set +e
+            terraform plan \
+              "${TF_TARGETS_ARGS[@]}" \
+              -var-file=../environments/prod/terraform.tfvars \
+              -var-file=../environments/prod/secrets.tfvars \
+              -no-color \
+              -lock-timeout=5m \
+              -refresh=<< pipeline.parameters.refresh >> \
+              -detailed-exitcode \
+              -out=tfplan-prod 2>&1 | tee plan-output.txt
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+
+            if [ "$PLAN_EXIT" -eq 1 ]; then
+              echo "Terraform plan failed" >&2; exit 1
+            elif [ "$PLAN_EXIT" -eq 0 ]; then
+              echo "No changes detected in prod"
+              circleci step halt
+            else
+              echo "⚠️  Changes detected in prod — approval required"
+            fi
+      - store_artifacts:
+          path: ~/repo/deployment/plan-output.txt
+          destination: plan-prod-apply/plan-output.txt
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Apply: deployment/prod
+  # Runs after manual approval in the CircleCI UI.
+  # Re-plans before applying to guard against state drift during the approval
+  # window (same pattern as the GitHub Actions workflow).
+  # ═══════════════════════════════════════════════════════════════════════════
+  apply-prod:
+    executor: tf-gcloud
+    environment:
+      GCP_PROJECT_ID: spiffy-prod
+      GCP_REGION: us-central1
+    steps:
+      - checkout
+      - install-terraform
+      - auth-gcp:
+          wif-provider-var: CCI_WIF_PROVIDER_PROD
+          sa-email-var: SA_EMAIL_PROD
+      - run:
+          name: Configure gcloud project
+          command: gcloud config set project "$GCP_PROJECT_ID"
+      - run:
+          name: Install gke-gcloud-auth-plugin
+          command: apt-get update -qq && apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin
+      - run:
+          name: Authenticate to GKE clusters (prod)
+          command: |
+            gcloud container clusters get-credentials gke-default \
+              --region "$GCP_REGION" --project "$GCP_PROJECT_ID"
+            gcloud container clusters get-credentials gke-dws-primary-region \
+              --region "$GCP_REGION" --project "$GCP_PROJECT_ID"
+            gcloud container clusters get-credentials gke-us-west1 \
+              --region us-west1 --project "$GCP_PROJECT_ID"
+      - setup-aws-prod
+      - build-secrets-tfvars:
+          working-dir: ~/repo/environments/prod
+      - run:
+          name: Terraform Init (prod)
+          working_directory: ~/repo/deployment
+          command: |
+            export TF_DATA_DIR="../environments/prod/.terraform"
+            terraform init -backend-config=../environments/prod/backend.tfvars
+      - build-tf-targets
+      - run:
+          name: Terraform Plan (prod) — fresh plan after approval
+          working_directory: ~/repo/deployment
+          command: |
+            export TF_DATA_DIR="../environments/prod/.terraform"
+            terraform plan \
+              "${TF_TARGETS_ARGS[@]}" \
+              -var-file=../environments/prod/terraform.tfvars \
+              -var-file=../environments/prod/secrets.tfvars \
+              -no-color \
+              -lock-timeout=5m \
+              -refresh=<< pipeline.parameters.refresh >> \
+              -out=tfplan-prod 2>&1 | tee plan-output.txt
+      - run:
+          name: Terraform Apply (prod)
+          working_directory: ~/repo/deployment
+          command: |
+            if [ "<< pipeline.parameters.dry-run-only >>" = "true" ]; then
+              echo "dry-run-only=true — skipping apply"
+              exit 0
+            fi
+            export TF_DATA_DIR="../environments/prod/.terraform"
+            terraform apply \
+              -no-color \
+              -lock-timeout=5m \
+              tfplan-prod 2>&1 | tee apply-output.txt
+      - store_artifacts:
+          path: ~/repo/deployment/plan-output.txt
+          destination: apply-prod/plan-output.txt
+      - store_artifacts:
+          path: ~/repo/deployment/apply-output.txt
+          destination: apply-prod/apply-output.txt
+
+      # ── Release notes → Slack + record deployed SHA ─────────────────────────
+      # These run only on a successful apply, and are skipped on dry-run.
+      #
+      # Order matters: we print the notes and record the deployed SHA *before*
+      # posting to Slack, so neither depends on Slack being configured. Slack
+      # posting is handled by the circleci/slack orb, which needs these in the
+      # "terraform" context:
+      #   SLACK_ACCESS_TOKEN  — bot token with chat:write (orb requirement)
+      #   SLACK_ONCALL        — rotating on-call mention, e.g.
+      #                         "<!subteam^S0XXXXXXX|backend-oncall>" (optional)
+      # Until SLACK_ACCESS_TOKEN is set we halt before the orb (the orb hard-
+      # fails on a missing token), so the job stays green and the rendered
+      # notes are still available in the "Build…" step log to copy by hand.
+      - when:
+          condition:
+            not: << pipeline.parameters.dry-run-only >>
+          steps:
+            - run:
+                name: Build prod deploy release notes
+                working_directory: ~/repo
+                command: |
+                  # Ensure enough history to diff against the previously deployed SHA.
+                  git fetch --unshallow 2>/dev/null || git fetch --depth=500 2>/dev/null || true
+                  export CURRENT_SHA="$CIRCLE_SHA1"
+                  PREV_SHA=$(gsutil cat gs://spiffy-tfstate-prod/deployed/prod-sha.txt 2>/dev/null || echo "")
+                  export PREV_SHA
+                  PLAN_SUMMARY=$(grep -E "Plan:|No changes\." deployment/plan-output.txt 2>/dev/null | tail -1)
+                  export PLAN_SUMMARY
+                  # Renders the message and exports $SLACK_RELEASE_NOTES via $BASH_ENV.
+                  python3 .circleci/scripts/prod_release_notes.py
+            - run:
+                name: Record deployed SHA marker
+                command: |
+                  echo "$CIRCLE_SHA1" | gsutil cp - gs://spiffy-tfstate-prod/deployed/prod-sha.txt
+                  echo "Recorded prod deployed SHA: $CIRCLE_SHA1"
+            - run:
+                name: Skip Slack if no bot token configured
+                command: |
+                  if [ -z "${SLACK_ACCESS_TOKEN:-}" ]; then
+                    echo "SLACK_ACCESS_TOKEN not set — release notes are printed above; skipping Slack post."
+                    circleci step halt
+                  fi
+            - slack/notify:
+                channel: "#prod-changes"
+                event: pass
+                custom: |
+                  {
+                    "blocks": [
+                      {
+                        "type": "section",
+                        "text": { "type": "mrkdwn", "text": "$SLACK_RELEASE_NOTES" }
+                      }
+                    ]
+                  }
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Plan: central  (pre-apply — surfaces diff before approval gate)
+  # ═══════════════════════════════════════════════════════════════════════════
+  plan-central-apply:
+    executor: tf-gcloud
+    environment:
+      GCP_PROJECT_ID: spiffy-central
+    steps:
+      - checkout
+      - install-terraform
+      - auth-gcp:
+          wif-provider-var: CCI_WIF_PROVIDER_CENTRAL
+          sa-email-var: SA_EMAIL_CENTRAL
+      - run:
+          name: Configure gcloud project
+          command: gcloud config set project "$GCP_PROJECT_ID"
+      - run:
+          name: Terraform Init (central)
+          working_directory: ~/repo/central
+          command: terraform init
+      - build-tf-targets
+      - run:
+          name: Terraform Plan (central)
+          working_directory: ~/repo/central
+          command: |
+            set +e
+            terraform plan \
+              "${TF_TARGETS_ARGS[@]}" \
+              -var-file=terraform.tfvars \
+              -no-color \
+              -lock-timeout=5m \
+              -refresh=<< pipeline.parameters.refresh >> \
+              -detailed-exitcode \
+              -out=tfplan-central 2>&1 | tee plan-output.txt
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+
+            if [ "$PLAN_EXIT" -eq 1 ]; then
+              echo "Terraform plan failed" >&2; exit 1
+            elif [ "$PLAN_EXIT" -eq 0 ]; then
+              echo "No changes detected in central"
+              circleci step halt
+            else
+              echo "⚠️  Changes detected in central — approval required"
+            fi
+      - store_artifacts:
+          path: ~/repo/central/plan-output.txt
+          destination: plan-central-apply/plan-output.txt
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Apply: central
+  # Runs after manual approval in the CircleCI UI.
+  # Re-plans before applying to guard against state drift during the approval
+  # window (same pattern as apply-prod).
+  # ═══════════════════════════════════════════════════════════════════════════
+  apply-central:
+    executor: tf-gcloud
+    environment:
+      GCP_PROJECT_ID: spiffy-central
+    steps:
+      - checkout
+      - install-terraform
+      - auth-gcp:
+          wif-provider-var: CCI_WIF_PROVIDER_CENTRAL
+          sa-email-var: SA_EMAIL_CENTRAL
+      - run:
+          name: Configure gcloud project
+          command: gcloud config set project "$GCP_PROJECT_ID"
+      - run:
+          name: Terraform Init (central)
+          working_directory: ~/repo/central
+          command: terraform init
+      - build-tf-targets
+      - run:
+          name: Terraform Plan (central) — fresh plan after approval
+          working_directory: ~/repo/central
+          command: |
+            terraform plan \
+              "${TF_TARGETS_ARGS[@]}" \
+              -var-file=terraform.tfvars \
+              -no-color \
+              -lock-timeout=5m \
+              -refresh=<< pipeline.parameters.refresh >> \
+              -out=tfplan-central 2>&1 | tee plan-output.txt
+      - run:
+          name: Terraform Apply (central)
+          working_directory: ~/repo/central
+          command: |
+            if [ "<< pipeline.parameters.dry-run-only >>" = "true" ]; then
+              echo "dry-run-only=true — skipping apply"
+              exit 0
+            fi
+            terraform apply \
+              -no-color \
+              -lock-timeout=5m \
+              tfplan-central 2>&1 | tee apply-output.txt
+      - store_artifacts:
+          path: ~/repo/central/plan-output.txt
+          destination: apply-central/plan-output.txt
+      - store_artifacts:
+          path: ~/repo/central/apply-output.txt
+          destination: apply-central/apply-output.txt
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Workflows
+#
+#  ┌─ PR opened / pushed ─────────────────────────────────────────────────┐
+#  │  pr-plan: plan-dev ─┐                                                │
+#  │           plan-prod ─┤──► post-pr-comment (PR comment with diffs)   │
+#  │           plan-central ┘                                             │
+#  └──────────────────────────────────────────────────────────────────────┘
+#
+#  ┌─ Merged to main ─────────────────────────────────────────────────────┐
+#  │  main-apply:                                                          │
+#  │    apply-dev (auto) ───────────────────────────────────────────────  │
+#  │    plan-prod-apply ──► hold-prod ──────────► apply-prod (approval)  │
+#  │    plan-central-apply ──► hold-central ────► apply-central (approv) │
+#  └──────────────────────────────────────────────────────────────────────┘
+#
+#  ┌─ Manual dispatch via API or UI ──────────────────────────────────────┐
+#  │  apply-dev:     plan-dev-apply ──► hold-dev ──► apply-dev          │
+#  │  apply-prod:    plan-prod-apply ──► hold-prod ──► apply-prod       │
+#  │  apply-central: plan-central-apply ──► hold-central ──► apply-cen  │
+#  └──────────────────────────────────────────────────────────────────────┘
+# ─────────────────────────────────────────────────────────────────────────────
+workflows:
+
+  # ── PR Plan ────────────────────────────────────────────────────────────────
+  # Runs on every push to a non-main branch. If $CIRCLE_PULL_REQUEST is set,
+  # the results are posted as a PR comment; otherwise they're visible in the
+  # CircleCI UI only (useful for draft / pre-PR work).
+  pr-plan:
+    when:
+      and:
+        - equal: ["", << pipeline.parameters.apply-environment >>]
+        - not:
+            equal: ["main", << pipeline.git.branch >>]
+    jobs:
+      - plan-dev:
+          context: terraform
+      - plan-prod:
+          context: terraform
+      - plan-central:
+          context: terraform
+      - post-pr-comment:
+          context: terraform
+          requires:
+            - plan-dev
+            - plan-prod
+            - plan-central
+
+  # ── Apply on merge to main ─────────────────────────────────────────────────
+  # Dev applies automatically on merge to main (plan + apply, no gate).
+  # Prod and central require a human to click "Approve" in the CircleCI UI.
+  main-apply:
+    when:
+      and:
+        - equal: ["", << pipeline.parameters.apply-environment >>]
+        - equal: ["main", << pipeline.git.branch >>]
+    jobs:
+      - apply-dev:
+          context: terraform
+      - plan-prod-apply:
+          context: terraform
+      - hold-prod:
+          type: approval
+          requires:
+            - plan-prod-apply
+      - apply-prod:
+          # Slack context provides SLACK_ACCESS_TOKEN for the release-notes orb
+          context: [terraform, Slack]
+          requires:
+            - hold-prod
+      - plan-central-apply:
+          context: terraform
+      - hold-central:
+          type: approval
+          requires:
+            - plan-central-apply
+      - apply-central:
+          context: terraform
+          requires:
+            - hold-central
+
+  # ── Apply: dev ────────────────────────────────────────────────────────────
+  apply-dev:
+    when:
+      equal: ["dev", << pipeline.parameters.apply-environment >>]
+    jobs:
+      - plan-dev-apply:
+          context: terraform
+      - hold-dev:
+          type: approval
+          requires:
+            - plan-dev-apply
+      - apply-dev:
+          context: terraform
+          requires:
+            - hold-dev
+
+  # ── Apply: prod ───────────────────────────────────────────────────────────
+  apply-prod:
+    when:
+      equal: ["prod", << pipeline.parameters.apply-environment >>]
+    jobs:
+      - plan-prod-apply:
+          context: terraform
+      - hold-prod:
+          type: approval
+          requires:
+            - plan-prod-apply
+      - apply-prod:
+          # Slack context provides SLACK_ACCESS_TOKEN for the release-notes orb
+          context: [terraform, Slack]
+          requires:
+            - hold-prod
+
+  # ── Apply: central ────────────────────────────────────────────────────────
+  apply-central:
+    when:
+      equal: ["central", << pipeline.parameters.apply-environment >>]
+    jobs:
+      - plan-central-apply:
+          context: terraform
+      - hold-central:
+          type: approval
+          requires:
+            - plan-central-apply
+      - apply-central:
+          context: terraform
+          requires:
+            - hold-central

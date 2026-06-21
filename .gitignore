@@ -1,0 +1,25 @@
+#  Local .terraform directories
+**/.terraform/
+# .tfstate files
+*.tfstate
+*.tfstate.*
+*.swp
+# intellij
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/data*
+# secrets
+**/secrets.tfvars
+**/secrets.auto.tfvars
+.idea/sonarlint/
+/.idea/git_toolbox_prj.xml
+/.idea/checkstyle-idea.xml
+/lambdas/**/*.zip
+.idea/dbnavigator.xml
+/.idea/codeStyles/Project.xml
+/.idea/codestream.xml
+test/builds
+bi/dependencies/
+/.idea/aws.xml
+.idea/sonarlint-state.xml
+bi/lambdas/**/**.zip

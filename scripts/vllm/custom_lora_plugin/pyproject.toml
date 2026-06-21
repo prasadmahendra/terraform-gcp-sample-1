@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lora_gcs_bucket_resolver"
+version = "0.1"
+description = "Custom LoRA plugin package"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.entry-points."vllm.general_plugins"]
+gcs_bucket_resolver = "gcs_bucket_resolver:register_gcs_bucket_resolver"
+
+[tool.setuptools]
+py-modules = ["gcs_bucket_resolver"]

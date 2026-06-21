@@ -1,0 +1,35 @@
+FROM vllm/vllm-openai:v0.11.0
+
+ADD start_vllm_a100.sh start_vllm_a100.sh
+ADD start_vllm_h100.sh start_vllm_h100.sh
+ADD start_vllm_h100_quantized.sh start_vllm_h100_quantized.sh
+ADD start_vllm_llama8b_1xa100.sh start_vllm_llama8b_1xa100.sh
+ADD start_vllm_post_process.sh start_vllm_post_process.sh
+ADD start_llm.sh start_llm.sh
+ADD interactive_debug_vllm.py interactive_debug_vllm.py
+ADD interactive_vllm_start_debug.sh interactive_vllm_start_debug.sh
+ADD benchmark_multilora.py benchmark_multilora.py
+ADD start_vllm.py start_vllm.py
+ADD custom_lora_plugin custom_lora_plugin
+ADD test_vllm_concurrency.py test_vllm_concurrency.py
+ADD deep_health_check.py deep_health_check.py
+ADD rule_based_verifiers.py rule_based_verifiers.py
+RUN chmod +x deep_health_check.py
+RUN chmod +x start_vllm_a100.sh
+RUN chmod +x start_vllm_h100.sh
+RUN chmod +x start_vllm_h100_quantized.sh
+RUN chmod +x start_vllm_llama8b_1xa100.sh
+RUN chmod +x start_vllm_post_process.sh
+RUN chmod +x interactive_debug_vllm.py
+RUN chmod +x interactive_vllm_start_debug.sh
+RUN chmod +x start_vllm.py
+RUN chmod +x custom_lora_plugin
+RUN chmod +x test_vllm_concurrency.py
+RUN chmod +x rule_based_verifiers.py
+RUN chmod +x start_llm.sh
+RUN apt-get update && apt-get install -y curl python3 python3-pip unzip netcat
+RUN pip3 install gsutil python-Levenshtein
+RUN curl https://rclone.org/install.sh | sudo bash
+
+EXPOSE 8002
+ENTRYPOINT ["/bin/bash"]
